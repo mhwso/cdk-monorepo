@@ -9,7 +9,10 @@
     "watch": "tsc -w",
     "test": "jest",
     "cdk": "cdk",
-    "deploy": "tsc && cdk deploy"
+    "build::ng": "cd ui && ng build",
+    "compile": "cd services && tsc",
+    "deploy::all": "npm run compile && npm run build::ng && cdk deploy",
+    "deploy::cdk": "npm run compile && cdk deploy"
   },
   "devDependencies": {
     "@types/jest": "^29.5.5",

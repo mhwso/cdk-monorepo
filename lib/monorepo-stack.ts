@@ -1,11 +1,11 @@
 import * as cdk from 'aws-cdk-lib';
 import {CfnOutput, Duration, RemovalPolicy} from 'aws-cdk-lib';
 import {Construct} from 'constructs';
-import {BlockPublicAccess, Bucket, BucketAccessControl, ObjectOwnership} from 'aws-cdk-lib/aws-s3';
+import {Bucket} from 'aws-cdk-lib/aws-s3';
 import {BucketDeployment, Source} from 'aws-cdk-lib/aws-s3-deployment';
 import {Architecture, Code, Function, Runtime} from 'aws-cdk-lib/aws-lambda';
-import {LambdaIntegration, RestApi} from 'aws-cdk-lib/aws-apigateway';
-import {Certificate, DnsValidatedCertificate, ValidationMethod} from 'aws-cdk-lib/aws-certificatemanager';
+import {ApiKey, ApiKeySourceType, LambdaIntegration, RestApi, UsagePlan} from 'aws-cdk-lib/aws-apigateway';
+import {Certificate} from 'aws-cdk-lib/aws-certificatemanager';
 import {ARecord, HostedZone, RecordTarget} from 'aws-cdk-lib/aws-route53';
 import {
     AllowedMethods,
@@ -16,6 +16,10 @@ import {
 } from 'aws-cdk-lib/aws-cloudfront';
 import {S3Origin} from 'aws-cdk-lib/aws-cloudfront-origins';
 import {CloudFrontTarget} from 'aws-cdk-lib/aws-route53-targets';
+import {AttributeType, Table} from "aws-cdk-lib/aws-dynamodb";
+import * as SSM from "aws-cdk-lib/aws-ssm";
+import {ApiGateway} from "aws-cdk-lib/aws-events-targets";
+import {Secret} from "aws-cdk-lib/aws-secretsmanager";
 
 export interface ServiceProperties extends cdk.StackProps {
     readonly domainName: string;
@@ -29,28 +33,46 @@ export class MonorepoStack extends cdk.Stack {
                 readonly properties: ServiceProperties) {
         super(scope, id, properties);
 
-        // had to explicit set blockPublicAccess to be able to deploy bucket
+        /**************************************************************************************************
+         *
+         * S3
+         *
+         * **************************************************************************************************/
+
+            // had to explicit set blockPublicAccess to be able to deploy bucket
+            // blockPublicAccess: {
+            //     blockPublicAcls: false,
+            //         blockPublicPolicy: false,
+            //         restrictPublicBuckets: false,
+            //         ignorePublicAcls: false
+            // },
+            // publicReadAccess: true
+
         const uiBucket = new Bucket(this, 'UiBucket', {
-            bucketName: 'd2c-cdk-workshop-monorepo-ui-malte',
-            removalPolicy: RemovalPolicy.DESTROY,
-            autoDeleteObjects: true,
-            blockPublicAccess: {
-                blockPublicAcls: false,
-                blockPublicPolicy: false,
-                restrictPublicBuckets: false,
-                ignorePublicAcls: false
-            },
-            websiteIndexDocument: 'index.html',
-            websiteErrorDocument: 'index.html',
-            publicReadAccess: true,
+                bucketName: 'd2c-cdk-workshop-monorepo-ui-malte',
+                removalPolicy: RemovalPolicy.DESTROY,
+                autoDeleteObjects: true,
+                websiteIndexDocument: 'index.html',
+                websiteErrorDocument: 'index.html',
+            });
+
+        new BucketDeployment(this, 'UiDeployment', {
+            destinationBucket: uiBucket,
+            sources: [Source.asset('./ui/dist/my-app')],
         });
 
-        // had to use fromHostedZoneAttributes because i god error
-        // otherwise when deploying with fromHostedZoneId
+        /**************************************************************************************************
+         *
+         * ROUTE53 & CERTS & DISTRIBUTIONS
+         *
+         **************************************************************************************************/
+
+            // had to use fromHostedZoneAttributes because i god error
+            // otherwise when deploying with fromHostedZoneId
         const hostedZone = HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
-            zoneName: properties.domainName,
-            hostedZoneId: properties.hostedZoneId
-        });
+                zoneName: properties.domainName,
+                hostedZoneId: properties.hostedZoneId
+            });
 
         // ACM certificates that are used with CloudFront -- or higher-level constructs which rely on CloudFront
         // -- must be in the us-east-1 region. CloudFormation allows you to create a Stack with a CloudFront distribution in any region.
@@ -74,6 +96,7 @@ export class MonorepoStack extends cdk.Stack {
             comment: `OAI for ${id}`
         });
 
+        // Todo: invalidate Cloudfront when deployed
         const websiteDistribution = new Distribution(this, 'SiteDistribution', {
             certificate: usEast1Cert,
             defaultRootObject: 'index.html',
@@ -103,28 +126,130 @@ export class MonorepoStack extends cdk.Stack {
             zone: hostedZone
         });
 
-        new BucketDeployment(this, 'UiDeployment', {
-            destinationBucket: uiBucket,
-            sources: [Source.asset('./ui')],
-        });
+        /**************************************************************************************************
+         *
+         * LAMBDA
+         *
+         **************************************************************************************************/
 
-        const testFunction = new Function(this, 'TestFunction', {
+        const demoLambda = new Function(this, 'DemoLambda', {
             architecture: Architecture.ARM_64,
             runtime: Runtime.NODEJS_18_X,
             memorySize: 512,
-            code: Code.fromAsset('./service'),
-            handler: 'index.test'
+            code: Code.fromAsset('./services/demo'),
+            handler: 'index.handler'
         });
 
-        const api = new RestApi(this, 'RestApi', {});
-        api.root.addMethod('GET', new LambdaIntegration(testFunction, {
-            proxy: true
-        }));
+        const foobarLambda = new Function(this, 'FoobarLambda', {
+            architecture: Architecture.ARM_64,
+            runtime: Runtime.NODEJS_18_X,
+            memorySize: 512,
+            code: Code.fromAsset('./services/foobar'),
+            handler: 'index.handler'
+        });
+
+
+        /**************************************************************************************************
+         *
+         * API
+         *
+         **************************************************************************************************/
+
+        const api = new RestApi(this, 'RestApi', {
+            apiKeySourceType: ApiKeySourceType.HEADER,
+        });
+
+        const secret = new Secret(this, 'Secret', {
+            generateSecretString: {
+                generateStringKey: 'api_key',
+                secretStringTemplate: JSON.stringify({username: 'web_user'}),
+                excludeCharacters: ' %+~`#$&*()|[]{}:;<>?!\'/@"\\',
+            },
+        });
+
+        const secretValue = secret.secretValueFromJson('api_key').toString();
+
+        api.addApiKey('ApiKey', {
+            apiKeyName: `web-app-key`,
+            value: secretValue,
+        });
+
+        // const apiKey = new ApiKey(this, 'ApiKey');
+
+        // const usagePlan = new UsagePlan(this, 'UsagePlan', {
+        //     name: 'Usage Plan',
+        //     apiStages: [
+        //         {
+        //             api,
+        //             stage: api.deploymentStage,
+        //         },
+        //     ],
+        // });
+        //
+        // usagePlan.addApiKey(apiKey);
+
+
+        const demoRessource = api.root.addResource('demo');
+        const foobarRessource = api.root.addResource('foobar');
+
+        const demoIntegration = new LambdaIntegration(demoLambda);
+        const foobarIntegration = new LambdaIntegration(foobarLambda);
+
+        demoRessource.addMethod('GET', demoIntegration, {
+            apiKeyRequired: true,
+        });
+
+        foobarRessource.addMethod('GET', foobarIntegration, {
+            apiKeyRequired: true,
+        });
+
+
+        /**************************************************************************************************
+         *
+         * DYNAMODB
+         *
+         **************************************************************************************************/
+
+        new Table(this, 'MyFirstDynamoDBTable', {
+            tableName: 'my-first-dynamodb-table',
+            partitionKey: {
+                name: 'id',
+                type: AttributeType.STRING,
+            },
+        })
+
+        /**************************************************************************************************
+         *
+         * OUTPUTS
+         *
+         **************************************************************************************************/
 
         new CfnOutput(this, 'UiBucketDomainOutput', {
             exportName: 'ui-bucket:domain-name',
             value: uiBucket.bucketWebsiteDomainName,
             description: 'The website domain name for the UI bucket'
         });
+
+        // new CfnOutput(this, 'API Key ID', {
+        //     value: apiKey.keyId,
+        //     description: 'The api key for getting access'
+        // });
+
+        new CfnOutput(this, 'API Key ID', {
+            value: secretValue,
+            description: 'The api key for getting access'
+        });
+
+        /**************************************************************************************************
+         *
+         * SSM
+         *
+         **************************************************************************************************/
+
+        // new SSM.StringParameter(this, "Parameter", {
+        //     parameterName: "rest-api-secret-value",
+        //     description: "The secret for accessing the rest api",
+        //     stringValue: secretValue
+        // });
     }
 }
