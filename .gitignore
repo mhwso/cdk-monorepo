@@ -6,3 +6,9 @@ node_modules
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+/.idea/.gitignore
+/.idea/aws.xml
+/.idea/modules.xml
+/.idea/monorepo.iml
+/.idea/php.xml
+/.idea/vcs.xml
